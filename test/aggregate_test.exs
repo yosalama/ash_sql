@@ -230,6 +230,35 @@ defmodule AshSql.AggregateTest do
       assert selected_bindings(query) == [1]
     end
 
+    test "reselects an already joined query aggregate into the aggregates map", context do
+      {:ok, named} = Ash.Query.Aggregate.new(Post, "named", :count, path: [:comments])
+
+      {:ok, query} = reselect(context.query, [named])
+
+      assert selected_keys(query) == [:aggregates]
+      assert selected_aggregate_keys(query) == ["named"]
+      assert query.__ash_bindings__.select_aggregates == []
+    end
+
+    test "reselects an already joined resource aggregate into its field", context do
+      {:ok, aggregate} =
+        Ash.Query.Aggregate.new(Post, :highest_score, :max, path: [:comments], field: :score)
+
+      {:ok, query} = reselect(context.query, [%{aggregate | load: :highest_score}])
+
+      assert selected_keys(query) == [:highest_score]
+      assert query.__ash_bindings__.select_aggregates == [:highest_score]
+    end
+
+    test "keeps every already joined query aggregate", context do
+      {:ok, first} = Ash.Query.Aggregate.new(Post, "first", :count, path: [:comments])
+      {:ok, second} = Ash.Query.Aggregate.new(Post, "second", :count, path: [:comments])
+
+      {:ok, query} = reselect(context.query, [first, second])
+
+      assert selected_aggregate_keys(query) == ["first", "second"]
+    end
+
     test "selects a related aggregate only from its attachment path", context do
       {:ok, query} =
         AshSql.Aggregate.Lateral.add_aggregates(
@@ -388,6 +417,21 @@ defmodule AshSql.AggregateTest do
   defp filtered_join?(%{wheres: [_ | _]}), do: true
   defp filtered_join?(%{from: %{source: %Ecto.SubQuery{query: query}}}), do: filtered_join?(query)
   defp filtered_join?(_), do: false
+
+  defp reselect(query, aggregates) do
+    query
+    |> AshSql.Bindings.add_binding(%{type: :aggregate, path: [], aggregates: aggregates})
+    |> AshSql.Aggregate.Lateral.add_aggregates(aggregates, Post, true, 0)
+  end
+
+  defp selected_keys(query), do: query.select.expr |> map_keys() |> Enum.sort()
+
+  defp selected_aggregate_keys(query) do
+    {:%{}, _, fields} = query.select.expr
+    fields |> Keyword.fetch!(:aggregates) |> map_keys() |> Enum.sort()
+  end
+
+  defp map_keys({:%{}, _, fields}), do: Enum.map(fields, &elem(&1, 0))
 
   defp selected_bindings(query) do
     query.select.expr

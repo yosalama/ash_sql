@@ -43,53 +43,28 @@ defmodule AshSql.Aggregate.Lateral do
       |> Enum.uniq_by(& &1.name)
       |> Enum.split_with(&already_added?(&1, query.__ash_bindings__, root_data_path))
 
-    query =
-      if Enum.any?(already_computed_aggregates) && select? do
-        query.__ash_bindings__.bindings
-        |> Enum.filter(fn
-          {_binding, %{type: :aggregate, path: ^root_data_path}} -> true
-          _ -> false
-        end)
-        |> Enum.reduce(query, fn {agg_binding, %{aggregates: aggs}}, q ->
-          q = update_in(q.__ash_bindings__, &Map.put_new(&1, :select_aggregates, []))
+    {query, already_computed_dynamics} =
+      already_computed_dynamics(query, already_computed_aggregates, root_data_path, select?)
 
-          Enum.reduce(aggs, q, fn agg, q ->
-            if Enum.any?(already_computed_aggregates, &(&1.name == agg.name)) do
-              q =
-                update_in(q.__ash_bindings__.select_aggregates, fn select_aggs ->
-                  [agg.name | select_aggs]
-                end)
+    wrap_in_subquery? =
+      (query.limit || query.offset || query.distinct) && root_data_path == [] && select? &&
+        !query.__ash_bindings__[:lateral_join?] &&
+        Enum.any?(
+          remaining_aggregates,
+          &(not optimizable_first_aggregate?(resource, &1, query))
+        )
 
-              if is_nil(agg.default_value) do
-                from(row in q,
-                  select_merge: %{^agg.name => field(as(^agg_binding), ^agg.name)}
-                )
-              else
-                from(row in q,
-                  select_merge: %{
-                    ^agg.name => coalesce(field(as(^agg_binding), ^agg.name), ^agg.default_value)
-                  }
-                )
-              end
-            else
-              q
-            end
-          end)
-        end)
-      else
-        query
-      end
+    {query, already_computed_dynamics} =
+      cond do
+        !wrap_in_subquery? ->
+          {query, already_computed_dynamics}
 
-    query =
-      if (query.limit || query.offset || query.distinct) && root_data_path == [] && select? &&
-           !query.__ash_bindings__[:lateral_join?] &&
-           Enum.any?(
-             remaining_aggregates,
-             &(not optimizable_first_aggregate?(resource, &1, query))
-           ) do
-        wrap_in_subquery_for_aggregates(query)
-      else
-        query
+        already_computed_dynamics == [] ->
+          {wrap_in_subquery_for_aggregates(query), []}
+
+        true ->
+          query = add_aggregate_selects(query, already_computed_dynamics)
+          {wrap_in_subquery_for_aggregates(query), []}
       end
 
     result =
@@ -118,7 +93,7 @@ defmodule AshSql.Aggregate.Lateral do
           false
       end)
       |> Enum.reduce_while(
-        {:ok, query, []},
+        {:ok, query, already_computed_dynamics},
         fn {{path, resource, join_filters, read_action}, aggregates}, {:ok, query, dynamics} ->
           related = Ash.Resource.Info.related(resource, path)
           read_action = Ash.Resource.Info.action(related, read_action)
@@ -1864,6 +1839,45 @@ defmodule AshSql.Aggregate.Lateral do
       %Ash.Query.Exists{} -> true
       _ -> false
     end)
+  end
+
+  defp already_computed_dynamics(query, [_ | _] = already_computed, root_data_path, true) do
+    query.__ash_bindings__.bindings
+    |> Enum.filter(&match?({_binding, %{type: :aggregate, path: ^root_data_path}}, &1))
+    |> Enum.reduce({query, []}, fn {agg_binding, %{aggregates: aggs}}, acc ->
+      Enum.reduce(aggs, acc, fn agg, {query, dynamics} ->
+        case Enum.find(already_computed, &(&1.name == agg.name)) do
+          nil ->
+            {query, dynamics}
+
+          requested ->
+            dynamic = already_computed_dynamic(agg, agg_binding)
+
+            {add_select_aggregate(query, requested.load),
+             [{requested.load, agg.name, dynamic} | dynamics]}
+        end
+      end)
+    end)
+  end
+
+  defp already_computed_dynamics(query, _already_computed, _root_data_path, _select?),
+    do: {query, []}
+
+  defp already_computed_dynamic(%{default_value: nil, name: name}, binding),
+    do: Ecto.Query.dynamic(field(as(^binding), ^name))
+
+  defp already_computed_dynamic(%{default_value: default, name: name}, binding),
+    do: Ecto.Query.dynamic(coalesce(field(as(^binding), ^name), ^default))
+
+  defp add_select_aggregate(query, nil) do
+    update_in(query.__ash_bindings__, &Map.put_new(&1, :select_aggregates, []))
+  end
+
+  defp add_select_aggregate(query, load) do
+    update_in(
+      query.__ash_bindings__,
+      &Map.update(&1, :select_aggregates, [load], fn loads -> [load | loads] end)
+    )
   end
 
   defp add_aggregate_selects(query, dynamics) do
